@@ -1,0 +1,16 @@
+{
+  "crons": [
+    {
+      "path": "/api/cron/scraper",
+      "schedule": "*/30 * * * *"
+    },
+    {
+      "path": "/api/cron/patterns",
+      "schedule": "0 2 * * *"
+    },
+    {
+      "path": "/api/cron/cleanup",
+      "schedule": "0 3 * * *"
+    }
+  ]
+}

@@ -1,0 +1,354 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+}
+
+// ─── PLATFORM ────────────────────────────────────────────────────────────────
+
+model Organisation {
+  id            String    @id @default(cuid())
+  name          String
+  slug          String    @unique
+  city          String    @default("Kolkata")
+  plan          String    @default("free")
+  vehicleLimit  Int       @default(3)
+  trialEndsAt   DateTime?
+  billingEmail  String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  deletedAt     DateTime?
+
+  users         User[]
+  vehicles      Vehicle[]
+  drivers       Driver[]
+  routes        Route[]
+  trips         Trip[]
+  notifications Notification[]
+  invoices      InvoiceLog[]
+  flagOverrides OrgFeatureOverride[]
+
+  @@index([slug])
+  @@index([plan])
+}
+
+model User {
+  id                  String        @id @default(cuid())
+  email               String        @unique
+  hashedPassword      String
+  name                String
+  role                String        @default("admin")
+  organisationId      String?
+  organisation        Organisation? @relation(fields: [organisationId], references: [id])
+  lastLogin           DateTime?
+  failedLoginAttempts Int           @default(0)
+  lockedUntil         DateTime?
+  createdAt           DateTime      @default(now())
+
+  @@index([email])
+  @@index([organisationId])
+}
+
+// ─── FLEET ───────────────────────────────────────────────────────────────────
+
+model Vehicle {
+  id                 String       @id @default(cuid())
+  name               String
+  registrationNumber String
+  gpsTokenHash       String?
+  state              String       @default("offline")
+  lastLat            Float?
+  lastLng            Float?
+  lastPingAt         DateTime?
+  batteryLevel       Int?
+  organisationId     String
+  organisation       Organisation @relation(fields: [organisationId], references: [id])
+  deletedAt          DateTime?
+  createdAt          DateTime     @default(now())
+
+  drivers   Driver[]
+  trips     Trip[]
+  tracks    GPSTrack[]
+  anomalies Anomaly[]
+
+  @@index([organisationId])
+  @@index([gpsTokenHash])
+  @@index([state])
+}
+
+model Driver {
+  id             String       @id @default(cuid())
+  name           String
+  phone          String
+  vehicleId      String?
+  vehicle        Vehicle?     @relation(fields: [vehicleId], references: [id])
+  organisationId String
+  organisation   Organisation @relation(fields: [organisationId], references: [id])
+  createdAt      DateTime     @default(now())
+
+  @@index([organisationId])
+}
+
+// ─── ROUTES + TRIPS ──────────────────────────────────────────────────────────
+
+model Route {
+  id                  String       @id @default(cuid())
+  name                String
+  organisationId      String
+  organisation        Organisation @relation(fields: [organisationId], references: [id])
+  distanceFactor      Float        @default(1.3)
+  etaCorrectionFactor Float        @default(1.0)
+  createdAt           DateTime     @default(now())
+
+  stops Stop[]
+  trips Trip[]
+
+  @@index([organisationId])
+}
+
+model Stop {
+  id              String    @id @default(cuid())
+  name            String
+  lat             Float
+  lng             Float
+  order           Int
+  avgDwellMinutes Float     @default(1.5)
+  routeId         String
+  route           Route     @relation(fields: [routeId], references: [id], onDelete: Cascade)
+  students        Student[]
+
+  @@index([routeId])
+}
+
+model Trip {
+  id                 String       @id @default(cuid())
+  vehicleId          String
+  vehicle            Vehicle      @relation(fields: [vehicleId], references: [id])
+  routeId            String
+  route              Route        @relation(fields: [routeId], references: [id])
+  organisationId     String
+  organisation       Organisation @relation(fields: [organisationId], references: [id])
+  status             String       @default("scheduled")
+  scheduledAt        DateTime
+  startedAt          DateTime?
+  completedAt        DateTime?
+  cancelledAt        DateTime?
+  cancellationReason String?
+  etaAccuracySeconds Int?
+  createdAt          DateTime     @default(now())
+
+  tracks GPSTrack[]
+
+  @@index([organisationId])
+  @@index([vehicleId])
+  @@index([status])
+}
+
+// ─── GPS ─────────────────────────────────────────────────────────────────────
+
+model GPSTrack {
+  id         String   @id @default(cuid())
+  vehicleId  String
+  vehicle    Vehicle  @relation(fields: [vehicleId], references: [id])
+  tripId     String?
+  trip       Trip?    @relation(fields: [tripId], references: [id])
+  lat        Float
+  lng        Float
+  speed      Float    @default(0)
+  accuracy   Float    @default(0)
+  bearing    Float    @default(0)
+  battery    Int?
+  capturedAt DateTime
+  provider   String   @default("phone")
+  createdAt  DateTime @default(now())
+
+  @@index([vehicleId, capturedAt])
+  @@index([tripId])
+}
+
+model Anomaly {
+  id              String    @id @default(cuid())
+  vehicleId       String
+  vehicle         Vehicle   @relation(fields: [vehicleId], references: [id])
+  organisationId  String
+  type            String
+  severity        String    @default("warning")
+  details         Json?
+  detectedAt      DateTime  @default(now())
+  acknowledgedAt  DateTime?
+  acknowledgedBy  String?
+  suppressedUntil DateTime?
+  resolved        Boolean   @default(false)
+
+  @@index([organisationId])
+  @@index([resolved, detectedAt])
+}
+
+// ─── TRAFFIC INTELLIGENCE ────────────────────────────────────────────────────
+
+model TrafficIncident {
+  id         String   @id @default(cuid())
+  roadName   String
+  normalised String
+  lat        Float?
+  lng        Float?
+  type       String
+  severity   Float
+  confidence Float
+  source     String
+  headline   String
+  language   String   @default("en")
+  reportedAt DateTime
+  expiresAt  DateTime
+  confirmed  Boolean?
+  createdAt  DateTime @default(now())
+
+  @@index([normalised])
+  @@index([reportedAt])
+  @@index([expiresAt])
+}
+
+model GeoCache {
+  id         String   @id @default(cuid())
+  query      String   @unique
+  normalised String
+  lat        Float
+  lng        Float
+  resolvedAt DateTime @default(now())
+
+  @@index([query])
+}
+
+model TrafficPattern {
+  id                  String   @id @default(cuid())
+  roadNormalised      String
+  hour                Int
+  dayOfWeek           Int
+  incidentProbability Float
+  avgSeverity         Float
+  sampleCount         Int
+  updatedAt           DateTime @updatedAt
+
+  @@unique([roadNormalised, hour, dayOfWeek])
+  @@index([roadNormalised])
+}
+
+model ScraperLog {
+  id              String    @id @default(cuid())
+  source          String
+  startedAt       DateTime  @default(now())
+  completedAt     DateTime?
+  success         Boolean?
+  itemsScraped    Int?
+  itemsClassified Int?
+  itemsStored     Int?
+  error           String?
+
+  @@index([source, startedAt])
+}
+
+// ─── STUDENTS + PARENTS ──────────────────────────────────────────────────────
+
+model Student {
+  id             String   @id @default(cuid())
+  name           String
+  parentPhone    String?
+  parentEmail    String?
+  stopId         String
+  stop           Stop     @relation(fields: [stopId], references: [id])
+  organisationId String
+  createdAt      DateTime @default(now())
+
+  @@index([organisationId])
+  @@index([parentPhone])
+}
+
+// ─── NOTIFICATIONS ───────────────────────────────────────────────────────────
+
+model Notification {
+  id             String       @id @default(cuid())
+  organisationId String
+  organisation   Organisation @relation(fields: [organisationId], references: [id])
+  title          String
+  body           String
+  type           String
+  readAt         DateTime?
+  createdAt      DateTime     @default(now())
+
+  @@index([organisationId])
+}
+
+// ─── DEVELOPER PORTAL ────────────────────────────────────────────────────────
+
+model DevLog {
+  id             String   @id @default(cuid())
+  action         String
+  actorEmail     String
+  target         String
+  organisationId String?
+  details        Json?
+  createdAt      DateTime @default(now())
+
+  @@index([organisationId])
+  @@index([createdAt])
+}
+
+model FeatureFlag {
+  id             String             @id @default(cuid())
+  key            String             @unique
+  description    String
+  defaultEnabled Boolean            @default(false)
+  createdAt      DateTime           @default(now())
+  overrides      OrgFeatureOverride[]
+}
+
+model OrgFeatureOverride {
+  id             String       @id @default(cuid())
+  flagId         String
+  flag           FeatureFlag  @relation(fields: [flagId], references: [id])
+  organisationId String
+  organisation   Organisation @relation(fields: [organisationId], references: [id])
+  enabled        Boolean
+
+  @@unique([flagId, organisationId])
+}
+
+model WaitlistEntry {
+  id           String    @id @default(cuid())
+  name         String
+  schoolName   String
+  city         String
+  phone        String
+  vehicleCount Int
+  status       String    @default("new")
+  notes        String?
+  submittedAt  DateTime  @default(now())
+  convertedAt  DateTime?
+}
+
+model InvoiceLog {
+  id             String       @id @default(cuid())
+  organisationId String
+  organisation   Organisation @relation(fields: [organisationId], references: [id])
+  amount         Int
+  plan           String
+  paidAt         DateTime
+  reference      String?
+  notes          String?
+  createdAt      DateTime     @default(now())
+}
+
+model CronLog {
+  id             String    @id @default(cuid())
+  jobName        String
+  startedAt      DateTime  @default(now())
+  completedAt    DateTime?
+  success        Boolean?
+  itemsProcessed Int?
+  error          String?
+
+  @@index([jobName, startedAt])
+}
