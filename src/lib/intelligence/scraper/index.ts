@@ -53,43 +53,57 @@ const ALL_SOURCES: SourceDef[] = [
 ];
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Constants
 // ---------------------------------------------------------------------------
 
 const CONFIDENCE_THRESHOLD = 0.25;
-const DEDUP_WINDOW_MS = 2 * 60 * 60 * 1000; // 2 hours
+const DEDUP_WINDOW_MS = 2 * 60 * 60 * 1000;
 
-/** Returns expiresAt based on incident type. */
-function getExpiresAt(type: IncidentType, reportedAt: Date): Date {
-  const longExpiry: IncidentType[] = [IncidentType.ACCIDENT, IncidentType.FLOODING];
-  const hoursToAdd = longExpiry.includes(type) ? 8 : 4;
-  return new Date(reportedAt.getTime() + hoursToAdd * 60 * 60 * 1000);
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Map confidence to numeric severity matching Prisma schema Int field.
+ * 1 = low, 2 = medium, 3 = high
+ */
+function confidenceToSeverity(confidence: number): number {
+  if (confidence >= 0.8) return 3;
+  if (confidence >= 0.5) return 2;
+  return 1;
 }
 
 /**
- * Check TrafficIncident table for a duplicate within the last 2 hours.
+ * expiresAt = reportedAt + 4h for jam/signal, + 8h for accident/flooding/diversion
+ */
+function getExpiresAt(type: IncidentType, reportedAt: Date): Date {
+  const shortExpiry: IncidentType[] = [IncidentType.JAM, IncidentType.SIGNAL];
+  const hours = shortExpiry.includes(type) ? 4 : 8;
+  return new Date(reportedAt.getTime() + hours * 60 * 60 * 1000);
+}
+
+/**
+ * Check for a duplicate incident in the last 2 hours.
  * Duplicate = same normalised road name + same incident type.
+ * Returns false immediately if normalised is empty.
  */
 async function isDuplicate(
-  normalised: string | null,
+  normalised: string,
   type: IncidentType
 ): Promise<boolean> {
   if (!normalised) return false;
-
   const since = new Date(Date.now() - DEDUP_WINDOW_MS);
   const existing = await prisma.trafficIncident.findFirst({
-    where: {
-      normalised,
-      type,
-      reportedAt: { gte: since },
-    },
+    where: { normalised, type, reportedAt: { gte: since } },
     select: { id: true },
   });
-
   return existing !== null;
 }
 
-/** Write a ScraperLog row for one source. Non-fatal — errors are swallowed. */
+/**
+ * Write a ScraperLog row for one source.
+ * Non-fatal — swallows its own errors.
+ */
 async function writeScraperLog(
   source: string,
   startedAt: Date,
@@ -114,7 +128,7 @@ async function writeScraperLog(
       },
     });
   } catch (err) {
-    console.error("[scraper/index] Failed to write ScraperLog:", source, err);
+    console.error("[scraper] Failed to write ScraperLog for", source, err);
   }
 }
 
@@ -129,8 +143,9 @@ export async function runScraper(options?: {
   const dryRun = options?.dryRun ?? false;
   const sourceFilter = options?.sources ?? null;
   const orchestratorStart = Date.now();
+  const sourceStartedAt = new Date();
 
-  // Select which sources to run
+  // Select active sources
   const activeSources = sourceFilter
     ? ALL_SOURCES.filter((s) => sourceFilter.includes(s.name))
     : ALL_SOURCES;
@@ -138,60 +153,60 @@ export async function runScraper(options?: {
   // -------------------------------------------------------------------------
   // Step 1: Run all scrapers in parallel
   // -------------------------------------------------------------------------
-  const sourceStartedAt = new Date();
   const settled = await Promise.allSettled(
     activeSources.map((s) => s.scrape())
   );
 
   // -------------------------------------------------------------------------
-  // Step 2: Flatten + track per-source counts for ScraperLog
+  // Step 2: Flatten + initialise per-source tracking
   // -------------------------------------------------------------------------
   const allArticles: (RawArticle & { _source: string })[] = [];
-  const sourceItemCounts: Record<string, number> = {};
+
+  const perSource = activeSources.map((s, idx) => ({
+    name: s.name,
+    succeeded: settled[idx].status === "fulfilled",
+    error:
+      settled[idx].status === "rejected"
+        ? ((settled[idx] as PromiseRejectedResult).reason?.message ?? "unknown error")
+        : undefined,
+    scraped: 0,
+    classified: 0,
+    stored: 0,
+  }));
 
   settled.forEach((result, idx) => {
-    const sourceDef = activeSources[idx];
     if (result.status === "fulfilled") {
       const articles = result.value;
-      sourceItemCounts[sourceDef.name] = articles.length;
+      perSource[idx].scraped = articles.length;
       for (const article of articles) {
-        allArticles.push({ ...article, _source: sourceDef.name });
+        allArticles.push({ ...article, _source: activeSources[idx].name });
       }
     } else {
-      sourceItemCounts[sourceDef.name] = 0;
       console.error(
-        `[scraper/index] Source ${sourceDef.name} rejected:`,
-        result.reason
+        `[scraper] Source ${activeSources[idx].name} failed:`,
+        (result as PromiseRejectedResult).reason
       );
     }
   });
 
   // -------------------------------------------------------------------------
-  // Step 3–8: Classify → filter → geo → dedup → store per article
+  // Steps 3–7: Per-article pipeline
   // -------------------------------------------------------------------------
   const itemResults: ScraperItemResult[] = [];
-  const sourceClassifiedCounts: Record<string, number> = {};
-  const sourceStoredCounts: Record<string, number> = {};
-
-  // Initialise counters
-  for (const s of activeSources) {
-    sourceClassifiedCounts[s.name] = 0;
-    sourceStoredCounts[s.name] = 0;
-  }
 
   for (const article of allArticles) {
+    const sourceEntry = perSource.find((p) => p.name === article._source)!;
+
     // Step 3: NLP classification
-    const nlpInput = {
-      id: `${article._source}:${article.url}`,
+    const classification = classify({
+      id: `${article._source}::${article.url}`,
       text: `${article.headline} ${article.rawText}`.trim(),
       publishedAt: article.publishedAt?.toISOString() ?? new Date().toISOString(),
       source: article._source,
       language: article.language,
-    };
+    });
 
-    const classification = classify(nlpInput);
-
-    // Step 4: Confidence + unknown filter
+    // Step 4: Filter low-confidence and unknown
     if (
       classification.confidence < CONFIDENCE_THRESHOLD ||
       classification.type === IncidentType.UNKNOWN
@@ -211,7 +226,7 @@ export async function runScraper(options?: {
       continue;
     }
 
-    sourceClassifiedCounts[article._source]++;
+    sourceEntry.classified++;
 
     // Step 5: Geo resolution
     let geo: ScraperItemResult["geo"] = null;
@@ -226,19 +241,14 @@ export async function runScraper(options?: {
           };
         }
       } catch (err) {
-        console.error("[scraper/index] Geo resolution failed:", err);
+        console.error("[scraper] Geo resolution error:", err);
       }
     }
 
-    // Step 6: Deduplication
-    const isDup = await isDuplicate(
-      classification.roadName
-        ? classification.roadName.toLowerCase()
-        : null,
-      classification.type
-    );
-
-    if (isDup) {
+    // Step 6: Deduplication check
+    const normalised = classification.roadName?.toLowerCase() ?? "";
+    const dup = await isDuplicate(normalised, classification.type);
+    if (dup) {
       itemResults.push({
         headline: article.headline,
         source: article._source,
@@ -251,7 +261,9 @@ export async function runScraper(options?: {
       continue;
     }
 
-    // Step 7: Write to TrafficIncident (unless dryRun)
+    // Step 7: Write to TrafficIncident
+    // Schema fields: id, roadName, normalised, lat, lng, type,
+    //                severity, confidence, source, headline, reportedAt, expiresAt
     let stored = false;
     if (!dryRun) {
       try {
@@ -260,30 +272,31 @@ export async function runScraper(options?: {
 
         await prisma.trafficIncident.create({
           data: {
-            roadName: classification.roadName ?? article.headline.slice(0, 120),
-            normalised: classification.roadName?.toLowerCase() ?? "",
-            lat: geo?.lat ?? null,
-            lng: geo?.lng ?? null,
-            type: classification.type,
-            severity: confidenceToSeverityInt(classification.confidence),
+            roadName:   classification.roadName ?? article.headline.slice(0, 120),
+            normalised,
+            lat:        geo?.lat ?? null,
+            lng:        geo?.lng ?? null,
+            type:       classification.type,
+            severity:   confidenceToSeverity(classification.confidence),
             confidence: classification.confidence,
-            source: article._source,
-            headline: article.headline.slice(0, 500),
+            source:     article._source,
+            headline:   article.headline.slice(0, 500),
             reportedAt,
             expiresAt,
           },
         });
+
         stored = true;
-        sourceStoredCounts[article._source]++;
+        sourceEntry.stored++;
       } catch (err) {
-        console.error("[scraper/index] Failed to store TrafficIncident:", err);
+        console.error("[scraper] Failed to store TrafficIncident:", err);
       }
     }
 
     itemResults.push({
-      headline: article.headline,
-      source: article._source,
-      language: article.language,
+      headline:       article.headline,
+      source:         article._source,
+      language:       article.language,
       classification,
       geo,
       stored,
@@ -297,56 +310,29 @@ export async function runScraper(options?: {
   const completedAt = new Date();
 
   await Promise.allSettled(
-    activeSources.map((s, idx) => {
-      const succeeded = settled[idx].status === "fulfilled";
-      return writeScraperLog(
-        s.name,
+    perSource.map((p) =>
+      writeScraperLog(
+        p.name,
         sourceStartedAt,
         completedAt,
-        succeeded,
-        sourceItemCounts[s.name] ?? 0,
-        sourceClassifiedCounts[s.name] ?? 0,
-        sourceStoredCounts[s.name] ?? 0,
-        succeeded
-          ? undefined
-          : (settled[idx] as PromiseRejectedResult).reason?.message
-      );
-    })
+        p.succeeded,
+        p.scraped,
+        p.classified,
+        p.stored,
+        p.error
+      )
+    )
   );
 
   // -------------------------------------------------------------------------
   // Step 9: Return ScraperRunResult
   // -------------------------------------------------------------------------
-  const totalScraped = allArticles.length;
-  const totalClassified = Object.values(sourceClassifiedCounts).reduce(
-    (a, b) => a + b,
-    0
-  );
-  const totalStored = Object.values(sourceStoredCounts).reduce(
-    (a, b) => a + b,
-    0
-  );
-
   return {
-    source: activeSources.map((s) => s.name).join(","),
-    duration: Date.now() - orchestratorStart,
-    itemsScraped: totalScraped,
-    itemsClassified: totalClassified,
-    itemsStored: totalStored,
-    items: itemResults,
+    source:          activeSources.map((s) => s.name).join(","),
+    duration:        Date.now() - orchestratorStart,
+    itemsScraped:    perSource.reduce((a, p) => a + p.scraped, 0),
+    itemsClassified: perSource.reduce((a, p) => a + p.classified, 0),
+    itemsStored:     perSource.reduce((a, p) => a + p.stored, 0),
+    items:           itemResults,
   };
-}
-
-// ---------------------------------------------------------------------------
-// Utility
-// ---------------------------------------------------------------------------
-
-/**
- * Map confidence score to a numeric severity (1 = low, 2 = medium, 3 = high).
- * Matches the Int type declared in the Prisma schema for TrafficIncident.severity.
- */
-function confidenceToSeverityInt(confidence: number): number {
-  if (confidence >= 0.8) return 3;
-  if (confidence >= 0.5) return 2;
-  return 1;
 }
